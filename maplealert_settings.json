@@ -1,0 +1,20 @@
+{
+  "keywords": "거짓말,탐지기,올바른,문장을,입력을,클릭하세요,한글을,엔터키를,눌러주세요,보이는,발동,되었습니다,클릭해주세요,먼저,탐지기가",
+  "template_paths": [
+    "C:/Users/cyj/Downloads/boleta.png",
+    "C:/Users/cyj/Downloads/shape.png"
+  ],
+  "template_threshold": 0.6,
+  "ocr_engines": [
+    "rapidocr"
+  ],
+  "cooldown_sec": 3.0,
+  "show_overlay": true,
+  "ocr_variant_groups": [
+    "raw",
+    "invert",
+    "unsharp"
+  ],
+  "capture_fps": 5,
+  "window_geometry": "1407x1007+72+96"
+}
