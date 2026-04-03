@@ -88,12 +88,18 @@ class CaptureThread(threading.Thread):
         self._running = threading.Event()
         self._lock = threading.Lock()
         self._latest: Optional[np.ndarray] = None
+        self._frame_seq: int = 0
 
     def get_frame(self) -> Optional[np.ndarray]:
         with self._lock:
             if self._latest is None:
                 return None
             return self._latest.copy()
+
+    def get_frame_seq(self) -> int:
+        """grab 성공 시마다 증가. 미리보기에서 동일 프레임이면 그리기 생략용."""
+        with self._lock:
+            return self._frame_seq
 
     def stop(self) -> None:
         self._running.clear()
@@ -110,6 +116,7 @@ class CaptureThread(threading.Thread):
                     frame = cap.grab_bgr()
                     with self._lock:
                         self._latest = frame
+                        self._frame_seq += 1
                     if self._on_frame:
                         self._on_frame(frame)
                 except Exception:

@@ -156,6 +156,15 @@ class MapleAlertApp(tk.Tk):
         self._alert_cooldown_sec = 3.0
         self._detect_every_ms = 1200
         self._preview_scale = 0.5
+        # CPU: 미리보기 주기(ms), 동일 캡처 seq 이면 그리기 생략
+        self._preview_interval_ms = 66
+        self._preview_last_frame_seq = -1
+        # CPU: 폴링에서 설정 동기화·엔진 상태 검사 간격
+        self._ui_cfg_dirty = True
+        self._last_cfg_poll_sync = 0.0
+        self._last_ocr_status_check = 0.0
+        self._first_ocr_poll = True
+        self._ocr_status_stale = True
 
         self._thread: CaptureThread | None = None
         self._photo: ImageTk.PhotoImage | None = None
@@ -208,7 +217,7 @@ class MapleAlertApp(tk.Tk):
 
         self.title(APP_NAME)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(33, self._tick_preview)
+        self.after(self._preview_interval_ms, self._tick_preview)
         self.after(50, self._poll_detection_ui)
 
     def _build_ui(self) -> None:
@@ -396,6 +405,37 @@ class MapleAlertApp(tk.Tk):
         self._ocr_status = ttk.Label(self, text="", anchor=tk.W, wraplength=900)
         self._ocr_status.pack(fill=tk.X, padx=10, pady=(0, 8))
 
+        self._register_ui_cfg_dirty_traces()
+
+    def _register_ui_cfg_dirty_traces(self) -> None:
+        """키워드·템플릿·임계값·쿨다운 변경 시에만 감지 설정을 다시 맞추도록 표시."""
+
+        def _mark(*_args: object) -> None:
+            self._ui_cfg_dirty = True
+
+        for var in (
+            self._kw_var,
+            self._tpl_var,
+            self._th_var,
+            self._cd_var,
+        ):
+            var.trace_add("write", _mark)
+
+    def _effective_capture_fps(self) -> float:
+        """
+        사용자 캡처 FPS 와 감지 주기를 맞춰 불필요하게 빠른 grab 을 줄인다.
+        min(사용자 FPS, max(10, 2 * (1000/감지주기ms))) — 미리보기는 최소 ~10fps 유지.
+        """
+        try:
+            u = float(self._fps_var.get())
+        except ValueError:
+            u = 20.0
+        u = max(5.0, min(60.0, u))
+        d = max(150, int(self._detect_every_ms))
+        detect_hz_budget = 2.0 * (1000.0 / float(d))
+        cap = max(10.0, detect_hz_budget)
+        return min(u, cap)
+
     def _on_src_mode_change(self) -> None:
         if sys.platform != "win32":
             return
@@ -559,6 +599,9 @@ class MapleAlertApp(tk.Tk):
             data["window_geometry"] = wg
         try:
             _save_json_settings(data)
+            self._ui_cfg_dirty = False
+            self._last_cfg_poll_sync = time.monotonic()
+            self._ocr_status_stale = True
         except Exception as e:
             messagebox.showerror("저장 실패", str(e))
 
@@ -622,16 +665,24 @@ class MapleAlertApp(tk.Tk):
     def _on_detection_cfg_changed(self) -> None:
         """OCR 엔진·전처리 변형 변경 시 설정 즉시 반영 + 진행 중 키워드 OCR 중단 + 워커 대기 깨우기."""
         self._sync_cfg_from_ui()
+        self._ui_cfg_dirty = False
+        self._last_cfg_poll_sync = time.monotonic()
+        self._ocr_status_stale = True
         self._det_kw_abort.set()
         self._det_cfg_wake.set()
 
     def _start(self) -> None:
         self._stop()
         try:
-            fps = float(self._fps_var.get())
+            float(self._fps_var.get())
         except ValueError:
             messagebox.showerror("오류", "FPS를 숫자로 입력하세요.")
             return
+        fps = self._effective_capture_fps()
+        try:
+            fps_ui = float(self._fps_var.get())
+        except ValueError:
+            fps_ui = fps
         jt = self._bg_join_thread
         if jt is not None and jt.is_alive():
             jt.join(timeout=0.8)
@@ -667,10 +718,16 @@ class MapleAlertApp(tk.Tk):
             name="MapleAlert-Detect",
         )
         self._det_thread.start()
-        if hwnd is not None:
-            self._status.config(text=f"송출 중 — 선택 창 (HWND {hwnd}), {fps} FPS")
+        if abs(fps_ui - fps) > 0.51:
+            fps_txt = f"캡처 {fps:.0f} FPS (UI {fps_ui:.0f})"
         else:
-            self._status.config(text=f"송출 중 — 모니터 {mon}, {fps} FPS")
+            fps_txt = f"{fps:.0f} FPS"
+        if hwnd is not None:
+            self._status.config(
+                text=f"송출 중 — 선택 창 (HWND {hwnd}), {fps_txt}"
+            )
+        else:
+            self._status.config(text=f"송출 중 — 모니터 {mon}, {fps_txt}")
 
     def _detection_worker_loop(self) -> None:
         """OCR·템플릿 감지는 메인(UI) 스레드가 아닌 여기서만 실행."""
@@ -864,7 +921,13 @@ class MapleAlertApp(tk.Tk):
     def _tick_preview(self) -> None:
         if not self._running:
             return
+        iv = self._preview_interval_ms
         if self._thread:
+            seq = self._thread.get_frame_seq()
+            if seq > 0 and seq == self._preview_last_frame_seq:
+                self.after(iv, self._tick_preview)
+                return
+            self._preview_last_frame_seq = seq
             frame = self._thread.get_frame()
             if frame is not None:
                 if self._show_overlay_var.get():
@@ -885,35 +948,53 @@ class MapleAlertApp(tk.Tk):
                 x = max(0, (cw - nw) // 2)
                 y = max(0, (ch - nh) // 2)
                 self._canvas.create_image(x, y, anchor=tk.NW, image=self._photo)
-        self.after(33, self._tick_preview)
+        else:
+            self._preview_last_frame_seq = -1
+        self.after(iv, self._tick_preview)
 
     def _poll_detection_ui(self) -> None:
         """무거운 감지는 워커 스레드 결과만 반영 (UI 멈춤 방지)."""
         if not self._running:
             return
-        self._sync_cfg_from_ui()
-        selected = self._ocr_engines_for_cfg()
-        if not selected:
-            self._ocr_status.config(
-                text="키워드 OCR — 엔진 미선택 (키워드 감지 안 함)",
-                foreground="#a63",
-            )
-        else:
-            parts: list[str] = []
-            all_ok = True
-            for eng in selected:
-                o_ok, o_msg = ocr_runtime_ok(eng)
-                if not o_ok:
-                    all_ok = False
-                if o_ok:
-                    parts.append(f"{eng}: 사용 가능")
-                else:
-                    short = o_msg if len(o_msg) <= 80 else o_msg[:77] + "…"
-                    parts.append(f"{eng}: {short}")
-            self._ocr_status.config(
-                text="키워드 OCR — " + " · ".join(parts),
-                foreground="gray" if all_ok else "#a63",
-            )
+        now = time.monotonic()
+        cfg_resync_sec = 3.0
+        ocr_status_resync_sec = 3.0
+        if self._ui_cfg_dirty or now - self._last_cfg_poll_sync >= cfg_resync_sec:
+            self._sync_cfg_from_ui()
+            self._ui_cfg_dirty = False
+            self._last_cfg_poll_sync = now
+
+        refresh_ocr = (
+            self._first_ocr_poll
+            or self._ocr_status_stale
+            or (now - self._last_ocr_status_check >= ocr_status_resync_sec)
+        )
+        if refresh_ocr:
+            self._first_ocr_poll = False
+            self._ocr_status_stale = False
+            self._last_ocr_status_check = now
+            selected = self._ocr_engines_for_cfg()
+            if not selected:
+                self._ocr_status.config(
+                    text="키워드 OCR — 엔진 미선택 (키워드 감지 안 함)",
+                    foreground="#a63",
+                )
+            else:
+                parts: list[str] = []
+                all_ok = True
+                for eng in selected:
+                    o_ok, o_msg = ocr_runtime_ok(eng)
+                    if not o_ok:
+                        all_ok = False
+                    if o_ok:
+                        parts.append(f"{eng}: 사용 가능")
+                    else:
+                        short = o_msg if len(o_msg) <= 80 else o_msg[:77] + "…"
+                        parts.append(f"{eng}: {short}")
+                self._ocr_status.config(
+                    text="키워드 OCR — " + " · ".join(parts),
+                    foreground="gray" if all_ok else "#a63",
+                )
         if self._thread is not None:
             with self._det_lock:
                 triggered = self._last_det_triggered
