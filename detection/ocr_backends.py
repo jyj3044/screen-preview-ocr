@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import time
 from pathlib import Path
@@ -16,7 +17,10 @@ from urllib.request import Request, urlopen
 import cv2
 import numpy as np
 
-from .ocr_diag import begin_ocr_call, end_ocr_call
+from .ocr_diag import begin_ocr_call, end_ocr_call, log_ocr_activity
+
+_tesseract_version_probe_logged = False
+_tesseract_version_probe_lock = threading.Lock()
 
 
 def _shape_prep_detail(
@@ -91,9 +95,36 @@ def _rapid_korean_cache_dir() -> Path:
     return p
 
 
-def _download_to_file(url: str, dest: Path, *, min_bytes: int, timeout_sec: float = 120.0) -> bool:
+def _download_to_file(
+    url: str,
+    dest: Path,
+    *,
+    min_bytes: int,
+    timeout_sec: float = 120.0,
+    log_engine: str = "rapidocr",
+    asset_name: str = "",
+) -> bool:
+    label = (asset_name or dest.name).strip() or dest.name
+    tail = url.rstrip("/").split("/")[-1]
+    if "?" in tail:
+        tail = tail.split("?", 1)[0]
+    tail = (tail or "url")[:72]
+
     if dest.exists() and dest.stat().st_size >= min_bytes:
+        log_ocr_activity(
+            "캐시",
+            log_engine,
+            f"{label} 기존 파일 사용 ({dest.stat().st_size:,} B)",
+        )
         return True
+
+    phase = "업데이트" if dest.exists() else "다운로드"
+    log_ocr_activity(
+        phase,
+        log_engine,
+        f"{label} 시작 ← {tail}",
+    )
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
@@ -101,11 +132,26 @@ def _download_to_file(url: str, dest: Path, *, min_bytes: int, timeout_sec: floa
         with urlopen(req, timeout=timeout_sec) as resp:
             data = resp.read()
         if len(data) < min_bytes:
+            log_ocr_activity(
+                "실패",
+                log_engine,
+                f"{label} 응답 크기 부족 ({len(data)} B)",
+            )
             return False
         tmp.write_bytes(data)
         tmp.replace(dest)
+        log_ocr_activity(
+            phase,
+            log_engine,
+            f"{label} 완료 ({len(data):,} B) → {dest.name}",
+        )
         return True
-    except (OSError, URLError, ValueError):
+    except (OSError, URLError, ValueError) as e:
+        log_ocr_activity(
+            "실패",
+            log_engine,
+            f"{label} {phase} 중단: {e}",
+        )
         try:
             if tmp.exists():
                 tmp.unlink()
@@ -118,8 +164,18 @@ def _ensure_rapid_korean_assets() -> Tuple[Optional[Path], Optional[Path]]:
     d = _rapid_korean_cache_dir()
     onnx_p = d / "korean_mobile_v2.0_rec_infer.onnx"
     keys_p = d / "korean_dict.txt"
-    ok_o = _download_to_file(_RAPID_KO_ONNX_URL, onnx_p, min_bytes=500_000)
-    ok_k = _download_to_file(_RAPID_KO_KEYS_URL, keys_p, min_bytes=10_000)
+    ok_o = _download_to_file(
+        _RAPID_KO_ONNX_URL,
+        onnx_p,
+        min_bytes=500_000,
+        asset_name="한글 rec ONNX",
+    )
+    ok_k = _download_to_file(
+        _RAPID_KO_KEYS_URL,
+        keys_p,
+        min_bytes=10_000,
+        asset_name="한글 사전",
+    )
     if ok_o and ok_k:
         return onnx_p, keys_p
     return None, None
@@ -142,6 +198,11 @@ def normalize_ocr_engine(name: str) -> str:
 def _get_easy_reader():
     global _easy_reader
     if _easy_reader is None:
+        log_ocr_activity(
+            "정보",
+            "easyocr",
+            "Reader 초기화 — 최초 실행 시 모델 캐시 다운로드가 있을 수 있음",
+        )
         import easyocr
 
         _easy_reader = easyocr.Reader(["ko", "en"], gpu=False, verbose=False)
@@ -179,6 +240,18 @@ def _get_rapid():
             korean_ok = False
         _rapid_ocr = inst
         _rapid_ocr_korean_active = korean_ok
+        if korean_ok:
+            log_ocr_activity(
+                "정보",
+                "rapidocr",
+                "한글 rec·사전 적용된 RapidOCR 인스턴스 준비됨",
+            )
+        else:
+            log_ocr_activity(
+                "정보",
+                "rapidocr",
+                "한글 자원 미적용 — 패키지 기본(중국어 위주) 인식",
+            )
         return _rapid_ocr
 
 
@@ -234,6 +307,41 @@ def _tesseract_dict_text_blob(data: Optional[Dict[str, List]]) -> str:
     return " ".join((str(t) or "").lower() for t in parts)
 
 
+def _tesseract_exe_display() -> str:
+    try:
+        import pytesseract.pytesseract as pt
+
+        cmd = getattr(pt, "tesseract_cmd", None)
+        if cmd:
+            p = Path(str(cmd))
+            return p.name if p.name else str(cmd)[:48]
+    except Exception:
+        pass
+    return "tesseract"
+
+
+def _log_tesseract_subprocess(operation: str, extra: str = "") -> None:
+    exe = _tesseract_exe_display()
+    msg = f"{exe} 자식 프로세스 실행 | {operation}"
+    e = (extra or "").strip()
+    if e:
+        msg = f"{msg} | {e}"
+    log_ocr_activity("프로세스", "tesseract", msg)
+
+
+def _log_tesseract_version_probe_once() -> None:
+    """UI 가 주기적으로 ocr_runtime_ok 를 호출하므로 버전 프로브는 최초 1회만 로그."""
+    global _tesseract_version_probe_logged
+    with _tesseract_version_probe_lock:
+        if _tesseract_version_probe_logged:
+            return
+        _tesseract_version_probe_logged = True
+    _log_tesseract_subprocess(
+        "get_tesseract_version",
+        "설치·PATH 확인 (동일 프로세스 내 이후 폴링은 프로세스 로그 생략)",
+    )
+
+
 def tesseract_image_to_data(
     rgb: np.ndarray,
     ocr_config: str,
@@ -253,6 +361,10 @@ def tesseract_image_to_data(
             t0 = time.perf_counter()
             out: Optional[Dict[str, List]] = None
             try:
+                _log_tesseract_subprocess(
+                    "image_to_data",
+                    f"lang={lang} {cfg_short}".strip(),
+                )
                 out = pytesseract.image_to_data(
                     rgb,
                     output_type=pytesseract.Output.DICT,
@@ -278,6 +390,7 @@ def tesseract_image_to_data(
     t0 = time.perf_counter()
     out_fb: Optional[Dict[str, List]] = None
     try:
+        _log_tesseract_subprocess("image_to_data", f"lang=- {cfg_short}".strip())
         out_fb = pytesseract.image_to_data(
             rgb, output_type=pytesseract.Output.DICT, config=ocr_config
         )
@@ -317,6 +430,10 @@ def tesseract_call_image_to_string(
     t0 = time.perf_counter()
     out = ""
     try:
+        _log_tesseract_subprocess(
+            "image_to_string",
+            f"{lang or '-'} {(config or '')[:40]}".strip(),
+        )
         if lang:
             s = pytesseract.image_to_string(rgb, lang=lang, config=config)
         else:
@@ -532,6 +649,7 @@ def ocr_engine_runtime_ok(engine: str) -> Tuple[bool, str]:
             import pytesseract
             import pytesseract.pytesseract as pt
 
+            _log_tesseract_version_probe_once()
             pt.get_tesseract_version()
             return True, ""
         except ImportError:
@@ -550,19 +668,34 @@ def ocr_engine_runtime_ok(engine: str) -> Tuple[bool, str]:
     if eng == ENGINE_RAPIDOCR:
         try:
             import rapidocr_onnxruntime  # noqa: F401
-
+        except ImportError as e:
+            if getattr(sys, "frozen", False):
+                return (
+                    False,
+                    "RapidOCR 번들 로드 실패. exe 재빌드 또는 "
+                    f"오류: {e!s}",
+                )
+            return False, f"rapidocr-onnxruntime 미설치: {e!s} (pip install rapidocr-onnxruntime)"
+        try:
             _get_rapid()
-            if _rapid_ocr_korean_active:
-                return True, ""
-            return (
-                True,
-                "한글 인식용 모델·사전을 받지 못했습니다. "
-                "중국어 기본 인식만 사용되어 한글이 거의 안 나올 수 있습니다. "
-                "네트워크 확인 후 "
-                f"{_rapid_korean_cache_dir()} 에 ONNX·korean_dict.txt 가 생기는지 보세요.",
-            )
-        except ImportError:
-            return False, "rapidocr-onnxruntime 미설치. pip install rapidocr-onnxruntime"
+        except ImportError as e:
+            if getattr(sys, "frozen", False):
+                return (
+                    False,
+                    "ONNX Runtime DLL/모듈 로드 실패(PyInstaller). "
+                    "Visual C++ 재배포 가능 패키지 설치 후 재시도. "
+                    f"상세: {e!s}",
+                )
+            return False, f"RapidOCR 초기화 import 실패: {e!s}"
         except Exception as e:
             return False, str(e)
+        if _rapid_ocr_korean_active:
+            return True, ""
+        return (
+            True,
+            "한글 인식용 모델·사전을 받지 못했습니다. "
+            "중국어 기본 인식만 사용되어 한글이 거의 안 나올 수 있습니다. "
+            "네트워크 확인 후 "
+            f"{_rapid_korean_cache_dir()} 에 ONNX·korean_dict.txt 가 생기는지 보세요.",
+        )
     return False, "알 수 없는 OCR 엔진"

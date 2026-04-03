@@ -47,6 +47,28 @@ _OCR_BOX_COUNT_OK = 10
 # Python 3.9+ 에서만 미시작 Future 취소
 _OCR_POOL_CANCEL = sys.version_info >= (3, 9)
 
+# PyInstaller exe: Tesseract 는 호출마다 subprocess → 변형×PSM 이 많으면 UI 프리즈 수준
+_TESSERACT_FROZEN_MAX_VARIANTS = 5
+
+
+def _tesseract_exe_light_mode() -> bool:
+    return getattr(sys, "frozen", False)
+
+
+def _cap_tesseract_variants(
+    variants: List[Tuple[np.ndarray, int, int, str]],
+) -> List[Tuple[np.ndarray, int, int, str]]:
+    if not _tesseract_exe_light_mode() or len(variants) <= _TESSERACT_FROZEN_MAX_VARIANTS:
+        return variants
+    return variants[:_TESSERACT_FROZEN_MAX_VARIANTS]
+
+
+def _tesseract_overlay_psms() -> Tuple[str, ...]:
+    if _tesseract_exe_light_mode():
+        return ("--oem 3 --psm 6", "--oem 3 --psm 11")
+    return ("--oem 3 --psm 6", "--oem 3 --psm 11", "--oem 3 --psm 3")
+
+
 # UI·설정: 비어 있으면 전부 사용. id → 로그 라벨 그룹 매핑은 _VARIANT_LOG_TO_GROUP
 OCR_VARIANT_UI_CHOICES: Tuple[Tuple[str, str], ...] = (
     ("raw", "원본 (리사이즈만, CLAHE·이진 없음)"),
@@ -450,8 +472,10 @@ def _ocr_string_from_frame_bgr(
 
     if pytesseract is None:
         return ""
-    variants = _iter_game_ocr_variants_rgb_with_scale(
-        frame_bgr, variant_groups=variant_groups
+    variants = _cap_tesseract_variants(
+        _iter_game_ocr_variants_rgb_with_scale(
+            frame_bgr, variant_groups=variant_groups
+        )
     )
     if not variants:
         return ""
@@ -543,6 +567,18 @@ def _ocr_string_from_frame_bgr(
     n_fast = min(8, len(variants))
     best, sc = run_pass(variants[:n_fast], _OCR_PSM_FAST, _OCR_LANG_FAST)
 
+    if _tesseract_exe_light_mode():
+        if seek_keywords is not None:
+            if sc >= _KW_FOUND:
+                return best
+            blob = " ".join(frags).lower()
+            if any(k in blob for k in seek_keywords):
+                return " ".join(frags)
+            return " ".join(frags) if frags else best
+        if sc >= _OCR_STRING_SCORE_OK:
+            return best
+        return best
+
     if seek_keywords is not None:
         if sc >= _KW_FOUND:
             return best
@@ -583,6 +619,8 @@ def _ocr_boxes_best_from_frame(
         frame_bgr,
         variant_groups=variant_groups,
     )
+    if eng == ENGINE_TESSERACT:
+        variants = _cap_tesseract_variants(variants)
     _log_kw = log_alert_keywords if log_alert_keywords else None
     best: List[Tuple[str, Tuple[int, int, int, int]]] = []
     best_ws, best_hs = 1, 1
@@ -658,7 +696,7 @@ def _ocr_boxes_best_from_frame(
                 break
         if done_early:
             break
-    if not done_early:
+    if not done_early and not _tesseract_exe_light_mode():
         for vi, (rgb, ws, hs, lab) in enumerate(variants):
             if _stop_req(stop_event):
                 break
@@ -771,6 +809,8 @@ def _overlay_keyword_text_fallback(
             variant_groups=variant_groups,
         )
     )
+    if eng == ENGINE_TESSERACT:
+        variant_list = _cap_tesseract_variants(variant_list)
     if not variant_list:
         return []
     _log_kw = tuple(keywords) if keywords else None
@@ -815,7 +855,7 @@ def _overlay_keyword_text_fallback(
         if pytesseract is None:
             return []
 
-        for psm in ("--oem 3 --psm 6", "--oem 3 --psm 11", "--oem 3 --psm 3"):
+        for psm in _tesseract_overlay_psms():
             if _stop_req(stop_event):
                 return []
             data = tesseract_image_to_data(
@@ -926,6 +966,8 @@ def _overlay_keyword_union_any_variant(
             variant_groups=variant_groups,
         )
     )
+    if eng == ENGINE_TESSERACT:
+        variant_list = _cap_tesseract_variants(variant_list)
     _log_kw = tuple(keywords) if keywords else None
     if not variant_list:
         return []
@@ -1009,7 +1051,7 @@ def _overlay_keyword_union_any_variant(
         rgb, ws, hs, lab = tri
         if _stop_req(stop_event):
             return None
-        for psm in ("--oem 3 --psm 6", "--oem 3 --psm 11", "--oem 3 --psm 3"):
+        for psm in _tesseract_overlay_psms():
             if _stop_req(stop_event):
                 return None
             data = tesseract_image_to_data(

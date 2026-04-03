@@ -26,6 +26,8 @@ import cv2
 from PIL import Image, ImageTk
 
 from capture import CaptureThread
+from detection.ocr_backends import ENGINE_RAPIDOCR
+
 from detection import (
     ALL_OCR_ENGINES,
     DEFAULT_OCR_ENGINE,
@@ -39,7 +41,23 @@ from detection import (
 )
 from preview_render import frame_with_overlays
 
-_SETTINGS_FILE = Path(__file__).resolve().parent / "maplealert_settings.json"
+
+def _app_writable_dir() -> Path:
+    """PyInstaller exe 일 때 설정 JSON 은 실행 파일과 같은 폴더에 둔다."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+_SETTINGS_FILE = _app_writable_dir() / "alert_settings.json"
+
+
+def _initial_ocr_engines() -> tuple[str, ...]:
+    """exe 배포본은 RapidOCR 이 번들됨. Tesseract 는 subprocess 비용이 커서 기본 선택을 RapidOCR 로 둔다."""
+    if getattr(sys, "frozen", False):
+        return (ENGINE_RAPIDOCR,)
+    return (DEFAULT_OCR_ENGINE,)
+
 
 # 창 제목·프로세스 표시 이름 (setproctitle, Windows 콘솔 제목)
 APP_NAME = "cyj"
@@ -70,6 +88,9 @@ if sys.platform == "win32":
 
         if os.path.isfile(_TESS_DEFAULT):
             pytesseract.pytesseract.tesseract_cmd = _TESS_DEFAULT
+        from tesseract_win_console import apply_pytesseract_windows_no_console
+
+        apply_pytesseract_windows_no_console()
     except ImportError:
         pass
 
@@ -150,7 +171,7 @@ class MapleAlertApp(tk.Tk):
             alert_keywords=("보스",),
             template_paths=(),
             template_threshold=0.80,
-            ocr_engines=(DEFAULT_OCR_ENGINE,),
+            ocr_engines=_initial_ocr_engines(),
             ocr_variant_groups=(),
         )
         self._alert_cooldown_sec = 3.0
@@ -813,7 +834,7 @@ class MapleAlertApp(tk.Tk):
                 pass
 
         win = tk.Toplevel(self)
-        win.title("OCR 호출 로그")
+        win.title("OCR 로그")
         win.geometry("920x440")
         win.transient(self)
 
@@ -841,7 +862,8 @@ class MapleAlertApp(tk.Tk):
         st.pack(fill=tk.BOTH, expand=True)
         st.insert(
             tk.END,
-            "# 번호 | 시각 | 엔진 | 작업 | 소요(ms) | …\n"
+            "# 번호 | 시각 | 엔진 | 작업 | 소요(ms) | …  (OCR API 호출·응답)\n"
+            "# * 로 시작: 다운로드·업데이트·캐시·실패·안내·프로세스 (예: tesseract.exe 자식 실행)\n"
             "# Tesseract: image_to_data / image_to_string 각 호출 1줄 (언어 폴백 시 여러 줄).\n"
             "# EasyOCR: readtext, RapidOCR: infer.\n\n",
         )
@@ -898,7 +920,7 @@ class MapleAlertApp(tk.Tk):
         self._ocr_log_text.delete("1.0", tk.END)
         self._ocr_log_text.insert(
             tk.END,
-            "# 화면만 비움. 카운터 초기화는 「통계 초기화」.\n\n",
+            "# 화면만 비움. 카운터·큐 초기화는 「통계 초기화」.\n\n",
         )
 
     def _ocr_log_reset(self) -> None:

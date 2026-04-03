@@ -1,4 +1,4 @@
-"""OCR 호출 횟수·소요 시간 로그 (감지 스레드 → 큐 → UI에서 소비)."""
+"""OCR 호출·다운로드·캐시 등 로그 (감지 스레드 → 큐 → UI에서 소비)."""
 
 from __future__ import annotations
 
@@ -24,9 +24,22 @@ def set_ocr_keyword_alert_sound_handler(
 
 def _fmt_detail(detail: str) -> str:
     d = (detail or "").replace("\n", " ")
-    if len(d) > 80:
-        d = d[:77] + "…"
+    if len(d) > 120:
+        d = d[:117] + "…"
     return d
+
+
+def log_ocr_activity(kind: str, engine: str, detail: str = "") -> None:
+    """
+    API 호출 한 쌍이 아닌 한 줄 로그 (다운로드·업데이트·캐시·실패 등).
+    줄 앞머리는 * 로 번호형(#) 호출 로그와 구분.
+    """
+    ts = time.strftime("%H:%M:%S")
+    k = (kind or "정보")[:10].ljust(10)
+    eng = (engine or "—")[:10].ljust(10)
+    d = _fmt_detail(detail)
+    line = f"* {ts} {eng} {k} — {d}\n"
+    _queue.put(line)
 
 
 def begin_ocr_call(

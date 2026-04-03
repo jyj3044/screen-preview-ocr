@@ -1,0 +1,9 @@
+# exe 배포용 최소 의존성 (개발용 requirements.txt 보다 가벼움)
+# EasyOCR 은 torch 용량이 커서 기본에서 제외 — 필요 시 venv 에 pip install easyocr 후 빌드
+mss>=9.0.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+setproctitle>=1.3.0
+pytesseract>=0.3.10
+rapidocr-onnxruntime>=1.3.0
