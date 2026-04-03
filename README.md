@@ -63,11 +63,13 @@ python main.py
 전역 Python에 `easyocr`가 있으면 PyInstaller가 **torch까지 끌어와 exe가 수백 MB**가 될 수 있으므로, **새 venv**에서 빌드하는 것을 권장합니다.
 
 ```powershell
-cd alert
+cd D:\경로\alert
 python -m venv .venv-build
-.\.venv-build\Scripts\activate
+.\.venv-build\Scripts\activate.bat
 python -m pip install --upgrade pip
 ```
+
+(`activate` 대신 `activate.bat` — PowerShell에서 스크립트 실행 정책 경고를 피하려면 CMD에서 실행하거나 `activate.bat` 사용.)
 
 빌드 전용 의존성 (`requirements-build.txt` → `requirements-runtime.txt` + PyInstaller):
 
@@ -89,13 +91,19 @@ pyinstaller --noconfirm build_exe.spec
 
 완료 후 산출물:
 
-- `dist\cyj.exe` (단일 exe, 콘솔 없음)
+- **`dist\cyj\` 폴더 전체** + 그 안의 `cyj.exe` (기본). 단일 exe가 아니라 **폴더째** 배포·실행합니다. RapidOCR/ONNX는 이 방식에서 훨씬 잘 동작합니다.
+- 예전처럼 **파일 하나만** 쓰려면 `build_exe.spec` 맨 위 `ONEFILE = True` 로 바꿔 빌드하세요 (같은 PC에서 `python main.py`는 되는데 exe만 깨질 때는 `False` 권장).
 
 ### exe 배포 시 참고
 
 - **Tesseract**: exe에 포함되지 않습니다. 사용 PC에 Tesseract 설치 또는 PATH 설정이 필요합니다.
 - **기본 OCR**: exe는 기본으로 **RapidOCR**을 쓰도록 되어 있으며, RapidOCR 관련 파일은 spec에서 번들됩니다.
-- **EasyOCR를 exe에 넣으려면**: venv에 `pip install easyocr` 후 `build_exe.spec` 안의 `hiddenimports.append("easyocr")` 주석을 해제하고 다시 빌드합니다 (용량·빌드 시간 증가).
+- **EasyOCR를 exe에 넣으려면**: `build_exe.spec` 에서 `INCLUDE_EASYOCR = True`, venv에 `pip install easyocr`, `hiddenimports.append("easyocr")` 주석 해제 후 빌드 (용량·빌드 시간 크게 증가, RapidOCR과 DLL 충돌 가능).
+- **RapidOCR / `onnxruntime_pybind11_state` DLL 초기화 실패 (`python main.py` 는 되는데 exe만 안 될 때)**:
+  - PyInstaller가 **`import easyocr` 를 따라가며 torch 전체를 번들**에 넣으면, torch·onnxruntime OpenMP DLL이 겹쳐 exe에서만 깨질 수 있습니다. 기본 spec은 **`INCLUDE_EASYOCR = False`** 로 **easyocr·torch를 제외**합니다. **최신 spec으로 다시 빌드**한 뒤 `dist\cyj\_internal` 안에 **`torch` 폴더가 없는지** 확인하세요.
+  - 그 외: `KMP_DUPLICATE_LIB_OK`, `_internal` 안 **DLL이 있는 모든 폴더**를 `add_dll_directory`에 등록(`bootstrap_onnx`), cv2 전 `onnxruntime` 선로드, `collect_all("onnxruntime")`, **onedir** 배포.
+  - 여전히 실패 시 `dist\cyj\` 옆에 생기는 **`pyi_rthook_onnx_error.txt`**(rthook 단계 예외) 내용을 확인하세요.
+  - **`onnxruntime` 버전**: exe 빌드용 `requirements-runtime.txt` 에서 **1.21.1 로 고정**해 두었습니다. 최신(1.24 등)은 PyInstaller 번들과 VC 런타임 조합에서 위 오류가 나는 보고가 있습니다. venv에서 `pip install -r requirements-build.txt` 후 다시 빌드하세요. venv에 옛 `msvc-runtime` 패키지가 깔려 있으면 제거하거나 최신으로 맞추는 것도 도움이 됩니다.
 
 ---
 

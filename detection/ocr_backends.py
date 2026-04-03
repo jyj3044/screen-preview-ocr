@@ -9,6 +9,7 @@ import math
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.error import URLError
@@ -18,6 +19,38 @@ import cv2
 import numpy as np
 
 from .ocr_diag import begin_ocr_call, end_ocr_call, log_ocr_activity
+
+
+def _import_error_detail(exc: BaseException) -> str:
+    """ImportError 등에 묻힌 DLL/원인 한 줄로 펼침 (exe 진단용)."""
+    parts: list[str] = []
+    cur: BaseException | None = exc
+    for _ in range(6):
+        if cur is None:
+            break
+        s = (str(cur) or "").strip() or type(cur).__name__
+        parts.append(s)
+        cur = cur.__cause__
+    return " | ".join(parts)
+
+
+_runtime_fail_logged: dict[str, str] = {}
+
+
+def _log_ocr_runtime_failure_once(engine_label: str, ok: bool, msg: str) -> None:
+    """OCR 런타임 점검 실패 시 메시지가 바뀔 때만 OCR 로그에 전체 기록 (상태줄은 짧게 유지)."""
+    key = (engine_label or "?").strip() or "?"
+    if ok:
+        _runtime_fail_logged.pop(key, None)
+        return
+    m = (msg or "").strip()
+    if not m:
+        return
+    if _runtime_fail_logged.get(key) == m:
+        return
+    _runtime_fail_logged[key] = m
+    log_ocr_activity("오류", key, m, truncate_detail=False)
+
 
 _tesseract_version_probe_logged = False
 _tesseract_version_probe_lock = threading.Lock()
@@ -640,8 +673,7 @@ def joined_text_from_rgb(
     return ""
 
 
-def ocr_engine_runtime_ok(engine: str) -> Tuple[bool, str]:
-    eng = normalize_ocr_engine(engine)
+def _ocr_engine_runtime_ok_core(eng: str) -> Tuple[bool, str]:
     if not eng:
         return False, "알 수 없는 OCR 엔진"
     if eng == ENGINE_TESSERACT:
@@ -669,22 +701,33 @@ def ocr_engine_runtime_ok(engine: str) -> Tuple[bool, str]:
         try:
             import rapidocr_onnxruntime  # noqa: F401
         except ImportError as e:
+            detail = _import_error_detail(e)
             if getattr(sys, "frozen", False):
+                tb = "".join(
+                    traceback.format_exception(type(e), e, e.__traceback__)
+                ).rstrip()
                 return (
                     False,
-                    "RapidOCR 번들 로드 실패. exe 재빌드 또는 "
-                    f"오류: {e!s}",
+                    "RapidOCR/ONNX 로드 실패. "
+                    "① exe 빌드 venv 에서 requirements-runtime 의 onnxruntime==1.21.1 설치 후 재빌드 "
+                    "(1.22+ 는 PyInstaller 번들과 pybind 초기화 충돌 보고 있음) "
+                    "② INCLUDE_EASYOCR=False·_internal 에 torch 없음 ③ VC++ 재배포·pyi_rthook_onnx_error.txt 확인. "
+                    f"상세: {detail}\n--- traceback ---\n{tb}",
                 )
-            return False, f"rapidocr-onnxruntime 미설치: {e!s} (pip install rapidocr-onnxruntime)"
+            return False, f"rapidocr-onnxruntime 미설치: {detail} (pip install rapidocr-onnxruntime)"
         try:
             _get_rapid()
         except ImportError as e:
+            detail = _import_error_detail(e)
             if getattr(sys, "frozen", False):
+                tb = "".join(
+                    traceback.format_exception(type(e), e, e.__traceback__)
+                ).rstrip()
                 return (
                     False,
                     "ONNX Runtime DLL/모듈 로드 실패(PyInstaller). "
-                    "Visual C++ 재배포 가능 패키지 설치 후 재시도. "
-                    f"상세: {e!s}",
+                    "VC++ 재배포·깨끗한 venv 재빌드·bootstrap_onnx_error.txt 를 확인하세요. "
+                    f"상세: {detail}\n--- traceback ---\n{tb}",
                 )
             return False, f"RapidOCR 초기화 import 실패: {e!s}"
         except Exception as e:
@@ -699,3 +742,11 @@ def ocr_engine_runtime_ok(engine: str) -> Tuple[bool, str]:
             f"{_rapid_korean_cache_dir()} 에 ONNX·korean_dict.txt 가 생기는지 보세요.",
         )
     return False, "알 수 없는 OCR 엔진"
+
+
+def ocr_engine_runtime_ok(engine: str) -> Tuple[bool, str]:
+    eng = normalize_ocr_engine(engine)
+    log_key = eng if eng else ((engine or "").strip() or "?")
+    ok, msg = _ocr_engine_runtime_ok_core(eng)
+    _log_ocr_runtime_failure_once(log_key, ok, msg)
+    return ok, msg

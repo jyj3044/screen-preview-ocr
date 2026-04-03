@@ -1,5 +1,5 @@
 """
-2·3단계 통합: 캡처 스레드 → Tkinter로 미리보기 + 감지 시 Windows 알림음.
+2·3단계 통합: 모니터·창 캡처 스레드 → 미리보기·OCR·감지가 동일 프레임 공유 + 알림음.
 실행 시 창 제목·프로세스 표시 이름은 APP_NAME(기본 cyj).
 
 실행 전:
@@ -13,8 +13,36 @@
 
 from __future__ import annotations
 
-import json
 import sys
+
+# rthook 다음 방어. cv2→numpy 로드 전에 두어야 OpenMP 중복과 onnxruntime 충돌을 줄임.
+if getattr(sys, "frozen", False):
+    import os
+
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    try:
+        import bootstrap_onnx
+
+        bootstrap_onnx.apply()
+    except Exception:
+        import traceback
+
+        try:
+            _base = os.path.dirname(os.path.abspath(sys.executable))
+            with open(
+                os.path.join(_base, "bootstrap_onnx_error.txt"),
+                "w",
+                encoding="utf-8",
+            ) as _f:
+                _f.write(traceback.format_exc())
+        except OSError:
+            pass
+    try:
+        import onnxruntime  # noqa: F401
+    except Exception:
+        pass
+
+import json
 import threading
 from typing import Optional
 import time
@@ -149,11 +177,28 @@ def _set_process_display_name(name: str) -> None:
             pass
 
 
+def stop_queued_alert_sounds() -> None:
+    """Windows: SND_ASYNC 로 쌓인 재생 큐 비우기(중지 후 이전 알림 소리가 이어질 때)."""
+    if sys.platform == "win32":
+        import winsound
+
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+
 def play_alert_sound() -> None:
     if sys.platform == "win32":
         import winsound
 
-        winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
+        # SND_NOSTOP: 이미 재생 중이면 새 요청 무시(쿨타임 밀림·중첩 완화)
+        flags = (
+            winsound.SND_ALIAS
+            | winsound.SND_ASYNC
+            | winsound.SND_NOSTOP
+        )
+        winsound.PlaySound("SystemExclamation", flags)
     else:
         try:
             import winsound  # type: ignore
@@ -175,7 +220,7 @@ class MapleAlertApp(tk.Tk):
             ocr_variant_groups=(),
         )
         self._alert_cooldown_sec = 3.0
-        self._detect_every_ms = 1200
+        self._detect_every_ms = 1000
         self._preview_scale = 0.5
         # CPU: 미리보기 주기(ms), 동일 캡처 seq 이면 그리기 생략
         self._preview_interval_ms = 66
@@ -202,11 +247,13 @@ class MapleAlertApp(tk.Tk):
         self._det_thread: threading.Thread | None = None
         self._last_det_triggered = False
         self._last_det_reason = ""
+        self._sound_armed = False
 
         self._ocr_log_win: tk.Toplevel | None = None
         self._ocr_log_text: scrolledtext.ScrolledText | None = None
         self._ocr_log_stats_var: tk.StringVar | None = None
         self._ocr_log_after_id: str | None = None
+        self._ocr_log_autoscroll_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._apply_settings_dict(_load_json_settings())
@@ -215,20 +262,9 @@ class MapleAlertApp(tk.Tk):
         self._last_alert_sound_ts = 0.0
 
         def _on_ocr_kw_alert_sound() -> None:
-            """OCR 응답마다 호출될 수 있으므로 UI 쿨다운과 동일 간격으로만 소리."""
-            with self._alert_sound_lock:
-                now = time.time()
-                cd = max(1.0, self._alert_cooldown_sec)
-                if now - self._last_alert_sound_ts < cd:
-                    return
-                self._last_alert_sound_ts = now
-
-            def _play() -> None:
-                if self._running:
-                    play_alert_sound()
-
+            """워커에서 호출됨 — 쿨다운·재생은 UI 스레드에서만 처리."""
             try:
-                self.after(0, _play)
+                self.after(0, self._try_alert_sound_from_ocr)
             except tk.TclError:
                 pass
 
@@ -245,7 +281,7 @@ class MapleAlertApp(tk.Tk):
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.X)
 
-        src = ttk.LabelFrame(top, text="캡처 대상", padding=(6, 4))
+        src = ttk.LabelFrame(top, text="캡처·송출 소스", padding=(6, 4))
         src.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self._src_mode = tk.StringVar(value="monitor")
@@ -303,7 +339,7 @@ class MapleAlertApp(tk.Tk):
         if sys.platform == "win32":
             self._on_src_mode_change()
 
-        mid = ttk.LabelFrame(self, text="송출 화면 (미리보기)", padding=4)
+        mid = ttk.LabelFrame(self, text="송출 화면 (미리보기·OCR 동일)", padding=4)
         mid.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
         self._canvas = tk.Canvas(mid, bg="#222", highlightthickness=0)
@@ -372,7 +408,7 @@ class MapleAlertApp(tk.Tk):
         )
         ttk.Label(
             tpl_col,
-            text="여러 장: 세미콜론(;)으로 구분 · 캡처 화면과 같은 해상도로 잘라 저장",
+            text="여러 장: 세미콜론(;)으로 구분 · 미리보기(캡처)와 같은 해상도로 잘라 저장",
             foreground="gray",
             font=("", 8),
         ).pack(side=tk.TOP, anchor=tk.W)
@@ -585,6 +621,16 @@ class MapleAlertApp(tk.Tk):
                 self._fps_var.set(str(f))
             except (TypeError, ValueError):
                 pass
+        if "capture_source_mode" in d and str(d["capture_source_mode"]).strip():
+            v = str(d["capture_source_mode"]).strip().lower()
+            if v == "stream":
+                v = "monitor"
+            if v in ("monitor", "window"):
+                if sys.platform != "win32" and v == "window":
+                    v = "monitor"
+                self._src_mode.set(v)
+        if sys.platform == "win32":
+            self._on_src_mode_change()
         if "window_geometry" in d:
             g = str(d["window_geometry"]).strip()
             if g:
@@ -614,6 +660,7 @@ class MapleAlertApp(tk.Tk):
             "show_overlay": self._show_overlay_var.get(),
             "ocr_variant_groups": list(og),
             "capture_fps": cap_fps,
+            "capture_source_mode": self._src_mode.get(),
         }
         wg = _read_window_geometry_str(self)
         if wg:
@@ -683,6 +730,23 @@ class MapleAlertApp(tk.Tk):
             self._cfg = new_cfg
         self._alert_cooldown_sec = max(1.0, cd)
 
+    def _try_alert_sound_from_ocr(self) -> None:
+        """OCR 키워드 알림(UI 스레드). 쿨타임 내 재요청·송출 중지 후 예약분은 무시."""
+        self._try_alert_sound()
+
+    def _try_alert_sound(self) -> None:
+        if not self._sound_armed:
+            return
+        if self._thread is None or self._det_thread is None:
+            return
+        with self._alert_sound_lock:
+            now = time.time()
+            cd = max(1.0, self._alert_cooldown_sec)
+            if now - self._last_alert_sound_ts < cd:
+                return
+            self._last_alert_sound_ts = now
+        play_alert_sound()
+
     def _on_detection_cfg_changed(self) -> None:
         """OCR 엔진·전처리 변형 변경 시 설정 즉시 반영 + 진행 중 키워드 OCR 중단 + 워커 대기 깨우기."""
         self._sync_cfg_from_ui()
@@ -743,6 +807,7 @@ class MapleAlertApp(tk.Tk):
             fps_txt = f"캡처 {fps:.0f} FPS (UI {fps_ui:.0f})"
         else:
             fps_txt = f"{fps:.0f} FPS"
+        self._sound_armed = True
         if hwnd is not None:
             self._status.config(
                 text=f"송출 중 — 선택 창 (HWND {hwnd}), {fps_txt}"
@@ -791,6 +856,8 @@ class MapleAlertApp(tk.Tk):
                 remaining -= step
 
     def _stop(self) -> None:
+        self._sound_armed = False
+        stop_queued_alert_sounds()
         self._det_stop.set()
         t_det = self._det_thread
         t_cap = self._thread
@@ -844,6 +911,11 @@ class MapleAlertApp(tk.Tk):
             value="누적 OCR API 호출: 0회 (감지 스레드에서 기록)"
         )
         ttk.Label(top, textvariable=self._ocr_log_stats_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            top,
+            text="맨 아래 자동 스크롤",
+            variable=self._ocr_log_autoscroll_var,
+        ).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(top, text="통계 초기화", command=self._ocr_log_reset).pack(
             side=tk.RIGHT, padx=4
         )
@@ -911,7 +983,8 @@ class MapleAlertApp(tk.Tk):
         except (tk.TclError, ValueError):
             pass
 
-        self._ocr_log_text.see(tk.END)
+        if self._ocr_log_autoscroll_var.get():
+            self._ocr_log_text.see(tk.END)
         self._ocr_log_after_id = self.after(120, self._tick_ocr_log_ui)
 
     def _ocr_log_clear_view(self) -> None:
@@ -1011,7 +1084,13 @@ class MapleAlertApp(tk.Tk):
                     if o_ok:
                         parts.append(f"{eng}: 사용 가능")
                     else:
-                        short = o_msg if len(o_msg) <= 80 else o_msg[:77] + "…"
+                        hint = " (전문은 OCR 로그)"
+                        room = max(24, 72 - len(hint))
+                        short = (
+                            o_msg
+                            if len(o_msg) <= room
+                            else o_msg[: max(1, room - 1)] + "…" + hint
+                        )
                         parts.append(f"{eng}: {short}")
                 self._ocr_status.config(
                     text="키워드 OCR — " + " · ".join(parts),
@@ -1025,12 +1104,7 @@ class MapleAlertApp(tk.Tk):
                 self._status.config(
                     text=f"알림! ({reason}) — {time.strftime('%H:%M:%S')}"
                 )
-                now = time.time()
-                cd = max(1.0, self._alert_cooldown_sec)
-                with self._alert_sound_lock:
-                    if now - self._last_alert_sound_ts >= cd:
-                        self._last_alert_sound_ts = now
-                        play_alert_sound()
+                self._try_alert_sound()
             self._was_triggered_last = triggered
         else:
             self._was_triggered_last = False

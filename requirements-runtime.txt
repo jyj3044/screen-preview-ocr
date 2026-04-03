@@ -7,3 +7,6 @@ Pillow>=10.0.0
 setproctitle>=1.3.0
 pytesseract>=0.3.10
 rapidocr-onnxruntime>=1.3.0
+# Windows PyInstaller exe: 1.22+ 는 번들 CRT/VC 와 충돌해 onnxruntime_pybind11_state 초기화 실패가 나는 경우가 있음
+# (예: https://github.com/microsoft/onnxruntime/issues/24843 ). 소스 실행만 쓰면 pip 로 최신 onnxruntime 써도 됨.
+onnxruntime==1.20.1

@@ -22,22 +22,36 @@ def set_ocr_keyword_alert_sound_handler(
     _on_keyword_alert_sound = fn
 
 
-def _fmt_detail(detail: str) -> str:
+def _fmt_detail(detail: str, *, max_len: int = 120) -> str:
     d = (detail or "").replace("\n", " ")
-    if len(d) > 120:
-        d = d[:117] + "…"
+    if max_len > 0 and len(d) > max_len:
+        d = d[: max_len - 1] + "…"
     return d
 
 
-def log_ocr_activity(kind: str, engine: str, detail: str = "") -> None:
+def log_ocr_activity(
+    kind: str,
+    engine: str,
+    detail: str = "",
+    *,
+    truncate_detail: bool = True,
+) -> None:
     """
     API 호출 한 쌍이 아닌 한 줄 로그 (다운로드·업데이트·캐시·실패 등).
     줄 앞머리는 * 로 번호형(#) 호출 로그와 구분.
+    truncate_detail=False 이면 긴 진단 메시지(예: exe ONNX 로드 실패)를 OCR 로그에 그대로 남김.
     """
     ts = time.strftime("%H:%M:%S")
     k = (kind or "정보")[:10].ljust(10)
     eng = (engine or "—")[:10].ljust(10)
-    d = _fmt_detail(detail)
+    raw = (detail or "").replace("\r\n", "\n").replace("\r", "\n")
+    if truncate_detail:
+        d = _fmt_detail(raw, max_len=120)
+    else:
+        d = raw.rstrip()
+        if len(d) > 12000:
+            d = d[:11999] + "…"
+        d = d.replace("\n", "\n    ")
     line = f"* {ts} {eng} {k} — {d}\n"
     _queue.put(line)
 

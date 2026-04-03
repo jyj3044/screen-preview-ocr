@@ -36,33 +36,37 @@ def load_template_bgr(path: str) -> Optional[np.ndarray]:
 
 def _match_at_scale(
     frame_bgr: np.ndarray, tpl_bgr: np.ndarray, threshold: float
-) -> Optional[Tuple[int, int, int, int, float]]:
+) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
+    """(임계 이상일 때만 사각형, 항상 최대 상관값 TM_CCOEFF_NORMED)."""
     fh, fw = frame_bgr.shape[:2]
     th0, tw0 = tpl_bgr.shape[:2]
     if th0 < 2 or tw0 < 2:
-        return None
+        return None, 0.0
     if th0 > fh or tw0 > fw:
-        return None
+        return None, 0.0
     frame_bgr = np.ascontiguousarray(frame_bgr)
     tpl_bgr = np.ascontiguousarray(tpl_bgr)
     try:
         res = cv2.matchTemplate(frame_bgr, tpl_bgr, cv2.TM_CCOEFF_NORMED)
     except cv2.error:
-        return None
+        return None, 0.0
     _min_v, max_v, _min_loc, max_loc = cv2.minMaxLoc(res)
-    if max_v < threshold:
-        return None
-    return (int(max_loc[0]), int(max_loc[1]), tw0, th0, float(max_v))
+    mv = float(max_v)
+    if mv < threshold:
+        return None, mv
+    return (int(max_loc[0]), int(max_loc[1]), tw0, th0), mv
 
 
 def match_one_template(
     frame_bgr: np.ndarray, template_path: str, threshold: float
-) -> Optional[Tuple[OverlayRect, float]]:
+) -> Tuple[Optional[Tuple[OverlayRect, float]], float]:
+    """(히트 시 (오버레이, 점수), 스케일 전체에서 관측한 최대 상관값)."""
     tpl0 = load_template_bgr(template_path)
     if tpl0 is None:
-        return None
+        return None, -1.0
     best: Optional[Tuple[int, int, int, int, float]] = None
     best_sc = threshold
+    max_seen = 0.0
     for sf in _TEMPLATE_SCALE_FACTORS:
         tw = max(2, int(round(tpl0.shape[1] * sf)))
         th = max(2, int(round(tpl0.shape[0] * sf)))
@@ -74,19 +78,21 @@ def match_one_template(
             )
         else:
             tpl = tpl0
-        hit = _match_at_scale(frame_bgr, tpl, threshold)
-        if hit is not None and hit[4] > best_sc:
-            best = hit
-            best_sc = hit[4]
+        rect, mv = _match_at_scale(frame_bgr, tpl, threshold)
+        max_seen = max(max_seen, mv)
+        if rect is not None and mv > best_sc:
+            x, y, rtw, rth = rect
+            best = (x, y, rtw, rth, mv)
+            best_sc = mv
     if best is None:
-        return None
+        return None, max_seen
     x, y, tw, th, sc = best
     base = os.path.basename(template_path)
     label = f"템플릿:{base}"
     ov = OverlayRect(
         x, y, tw, th, stable_overlay_bgr("tpl", x, y, tw, th), label
     )
-    return ov, sc
+    return (ov, sc), max_seen
 
 
 def match_all_templates(
@@ -94,16 +100,36 @@ def match_all_templates(
     template_paths: Tuple[str, ...],
     threshold: float,
 ) -> List[OverlayRect]:
+    from .ocr_diag import log_ocr_activity
+
     out: List[OverlayRect] = []
     seen_rect: set[Tuple[int, int, int, int]] = set()
     for p in template_paths:
         p = (p or "").strip()
         if not p:
             continue
-        hit = match_one_template(frame_bgr, p, threshold)
+        base = os.path.basename(p)
+        hit, max_seen = match_one_template(frame_bgr, p, threshold)
         if hit is None:
+            if max_seen < 0.0:
+                log_ocr_activity(
+                    "매칭",
+                    "템플릿",
+                    f"{base} 로드 실패",
+                )
+            else:
+                log_ocr_activity(
+                    "매칭",
+                    "템플릿",
+                    f"{base} 미일치 max={max_seen:.3f} 임계={threshold:.2f}",
+                )
             continue
-        ov, _sc = hit
+        ov, sc = hit
+        log_ocr_activity(
+            "매칭",
+            "템플릿",
+            f"{base} 일치 score={sc:.3f}",
+        )
         key = (ov.x, ov.y, ov.w, ov.h)
         if key in seen_rect:
             continue

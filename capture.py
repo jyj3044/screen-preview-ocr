@@ -1,15 +1,8 @@
 """
-1단계: 화면을 파이썬으로 캡처(송출에 해당하는 프레임 획득).
+1단계: 모니터 또는 지정 창에서 BGR 프레임 획득.
 
-- 실제로는 “인터넷 브라우저가 원격 스트림을 받는 것”과는 다릅니다.
-  네트워크로 게임 영상을 받는 구조가 아니라, 본인 PC에서 **이미 모니터에
-  출력된 화면**만 OS가 제공하는 캡처 경로로 읽습니다. (OBS·Discord 화면 공유와
-  같은 계열: 디스플레이/데스크톱 픽셀만 접근.)
-- **게임 프로세스 메모리를 읽거나 쓰지 않습니다.** DLL 주입·후킹·pymem 등도
-  사용하지 않습니다. 안티치트가 주로 겨냥하는 “메모리/코드 무결성 위반”과는
-  다른 방식입니다. (다만 게임·안티치트 정책은 제품마다 다를 수 있음.)
-
-실시간 GUI와 감지 로직은 이 프레임을 공유하면 됩니다.
+미리보기와 OCR·템플릿 감지는 CaptureThread.get_frame() 으로 **같은 최신 프레임**을
+읽습니다 (별도 경로 없음).
 """
 
 from __future__ import annotations
@@ -70,7 +63,7 @@ def _make_capture(
 class CaptureThread(threading.Thread):
     """
     백그라운드에서 주기적으로 캡처하여 최신 프레임만 보관.
-    GUI/감지 스레드는 get_frame() 으로 읽습니다.
+    GUI 미리보기와 감지 스레드는 get_frame() 으로 동일 버퍼를 읽습니다.
     """
 
     def __init__(
@@ -130,11 +123,11 @@ class CaptureThread(threading.Thread):
 
 
 if __name__ == "__main__":
-    # 단독 실행: 한 장 캡처 후 저장 (동작 확인용)
+    import cv2
+
     cap = ScreenCapture(monitor_index=1)
     img = cap.grab_bgr()
     cap.close()
-    import cv2
 
     cv2.imwrite("capture_test.png", img)
     print("저장됨: capture_test.png", img.shape)
