@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 import math
+import ssl
 import sys
 import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -114,11 +115,14 @@ _RAPID_INIT_LOCK = threading.Lock()
 _RAPID_INFER_LOCK = threading.Lock()
 
 # rapidocr_onnxruntime 기본값은 중국어 인식(rec)만 있어 한글이 거의 안 나옴 → PP-OCR 한국어 rec + 사전 사용
-_RAPID_KO_ONNX_URL = (
-    "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv1/korean_mobile_v2.0_rec_infer.onnx"
+_RAPID_KO_ONNX_URLS: Tuple[str, ...] = (
+    "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv1/korean_mobile_v2.0_rec_infer.onnx",
+    # 국내/기업망에서 huggingface.co 가 막힐 때 대안
+    "https://hf-mirror.com/SWHL/RapidOCR/resolve/main/PP-OCRv1/korean_mobile_v2.0_rec_infer.onnx",
 )
-_RAPID_KO_KEYS_URL = (
-    "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/korean_dict.txt"
+_RAPID_KO_KEYS_URLS: Tuple[str, ...] = (
+    "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/korean_dict.txt",
+    "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/release/2.7/ppocr/utils/dict/korean_dict.txt",
 )
 
 
@@ -126,6 +130,19 @@ def _rapid_korean_cache_dir() -> Path:
     p = Path.home() / ".cache" / "maplealert" / "rapidocr_korean"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _ssl_context_for_download() -> ssl.SSLContext:
+    """
+    macOS 등에서 python.org 빌드가 시스템 CA를 못 쓰면 urllib 가 SSL 검증 실패한다.
+    certifi 번들 CA를 쓰면 Hugging Face / GitHub raw 다운로드가 안정된다.
+    """
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 def _download_to_file(
@@ -160,9 +177,10 @@ def _download_to_file(
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
+    ctx = _ssl_context_for_download()
     try:
         req = Request(url, headers={"User-Agent": "MapleAlert/1.0 (RapidOCR Korean assets)"})
-        with urlopen(req, timeout=timeout_sec) as resp:
+        with urlopen(req, timeout=timeout_sec, context=ctx) as resp:
             data = resp.read()
         if len(data) < min_bytes:
             log_ocr_activity(
@@ -193,18 +211,41 @@ def _download_to_file(
         return False
 
 
+def _download_first_url(
+    urls: Union[str, Sequence[str]],
+    dest: Path,
+    *,
+    min_bytes: int,
+    timeout_sec: float = 120.0,
+    log_engine: str = "rapidocr",
+    asset_name: str = "",
+) -> bool:
+    seq: Tuple[str, ...] = (urls,) if isinstance(urls, str) else tuple(urls)
+    for u in seq:
+        if _download_to_file(
+            u,
+            dest,
+            min_bytes=min_bytes,
+            timeout_sec=timeout_sec,
+            log_engine=log_engine,
+            asset_name=asset_name,
+        ):
+            return True
+    return False
+
+
 def _ensure_rapid_korean_assets() -> Tuple[Optional[Path], Optional[Path]]:
     d = _rapid_korean_cache_dir()
     onnx_p = d / "korean_mobile_v2.0_rec_infer.onnx"
     keys_p = d / "korean_dict.txt"
-    ok_o = _download_to_file(
-        _RAPID_KO_ONNX_URL,
+    ok_o = _download_first_url(
+        _RAPID_KO_ONNX_URLS,
         onnx_p,
         min_bytes=500_000,
         asset_name="한글 rec ONNX",
     )
-    ok_k = _download_to_file(
-        _RAPID_KO_KEYS_URL,
+    ok_k = _download_first_url(
+        _RAPID_KO_KEYS_URLS,
         keys_p,
         min_bytes=10_000,
         asset_name="한글 사전",

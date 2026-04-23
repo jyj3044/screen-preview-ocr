@@ -1,3 +1,5 @@
-# exe 빌드 전용. 권장: 깨끗한 venv 에서 설치 후 build_exe.bat 실행
+# exe 빌드 전용. 권장: 깨끗한 venv 에서 설치 후 build_exe.bat / build_exe.sh 실행
 -r requirements-runtime.txt
 pyinstaller>=6.0
+# macOS 번들에서 창 캡처(darwin_capture)용
+pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'

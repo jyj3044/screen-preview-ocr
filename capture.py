@@ -81,6 +81,12 @@ class CaptureThread(threading.Thread):
         self._lock = threading.Lock()
         self._latest: Optional[np.ndarray] = None
         self._frame_seq: int = 0
+        self._capture_error: Optional[str] = None
+
+    def get_capture_error(self) -> Optional[str]:
+        """창·화면 캡처가 연속 실패할 때 마지막 예외 메시지 (성공 시 None)."""
+        with self._lock:
+            return self._capture_error
 
     def get_frame(self) -> Optional[np.ndarray]:
         with self._lock:
@@ -104,19 +110,24 @@ class CaptureThread(threading.Thread):
         try:
             while self._running.is_set():
                 t0 = time.perf_counter()
+                sleep_for = self._interval
                 try:
                     frame = cap.grab_bgr()
                     with self._lock:
                         self._latest = frame
                         self._frame_seq += 1
+                        self._capture_error = None
                     if self._on_frame:
                         self._on_frame(frame)
-                except Exception:
-                    pass
+                except Exception as e:
+                    with self._lock:
+                        if self._capture_error is None:
+                            self._capture_error = f"{type(e).__name__}: {e}"
+                    sleep_for = max(self._interval, 0.25)
                 elapsed = time.perf_counter() - t0
-                sleep_for = self._interval - elapsed
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
+                wait = sleep_for - elapsed
+                if wait > 0:
+                    time.sleep(wait)
         finally:
             cap.close()
 

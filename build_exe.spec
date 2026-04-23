@@ -10,6 +10,7 @@ ONEFILE = False
 # EasyOCR 을 exe 에 넣을 때만 True 로 두고, 아래 excludes 에서 torch 계열을 빼 준다.
 INCLUDE_EASYOCR = False
 
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs
@@ -53,9 +54,7 @@ _base_hidden = [
     "detection.ocr_diag",
     "detection.templates",
     "detection.overlay_store",
-    "windows_capture",
     "bootstrap_onnx",
-    "tesseract_win_console",
     "setproctitle",
     "mss",
     "cv2",
@@ -64,8 +63,17 @@ _base_hidden = [
     "rapidocr_onnxruntime",
     "onnxruntime",
 ]
+# windows_capture 는 mac 에서 import 시 즉시 실패하므로 플랫폼별로만 넣는다.
+_platform_hidden: list[str] = []
+if sys.platform == "win32":
+    _platform_hidden = ["windows_capture", "tesseract_win_console"]
+elif sys.platform == "darwin":
+    _platform_hidden = ["darwin_capture"]
+
 hiddenimports = list(
-    dict.fromkeys(_base_hidden + list(_rapid_hidden) + list(_onnx_hidden))
+    dict.fromkeys(
+        _base_hidden + _platform_hidden + list(_rapid_hidden) + list(_onnx_hidden)
+    )
 )
 # EasyOCR 을 exe 에 넣으려면: INCLUDE_EASYOCR = True, venv 에 easyocr 설치 후 아래 줄 주석 해제
 # hiddenimports.append("easyocr")
@@ -118,6 +126,10 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# macOS: windowed(console=False)는 터미널에서 실행해도 출력이 없어 "무반응"으로 보이기 쉬움.
+# 터미널 로그·stderr 로 디버깅 가능하도록 콘솔 사용 (배포용 .app 은 별도 BUNDLE/서명 검토).
+_use_console = sys.platform == "darwin"
+
 _exe_kw = dict(
     name="cyj",
     debug=False,
@@ -125,7 +137,7 @@ _exe_kw = dict(
     strip=False,
     upx=False,
     upx_exclude=[],
-    console=False,
+    console=_use_console,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

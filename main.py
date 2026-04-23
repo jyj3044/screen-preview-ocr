@@ -44,6 +44,7 @@ if getattr(sys, "frozen", False):
 
 import json
 import threading
+import traceback
 from typing import Optional
 import time
 import tkinter as tk
@@ -232,6 +233,7 @@ class MapleAlertApp(tk.Tk):
         self._last_det_triggered = False
         self._last_det_reason = ""
         self._sound_armed = False
+        self._stream_status_text = ""
 
         self._ocr_log_win: tk.Toplevel | None = None
         self._ocr_log_text: scrolledtext.ScrolledText | None = None
@@ -260,6 +262,24 @@ class MapleAlertApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(self._preview_interval_ms, self._tick_preview)
         self.after(50, self._poll_detection_ui)
+        if sys.platform == "darwin":
+            # 번들/터미널 실행 시 창이 뒤에 깔리는 경우가 많아 한 번 앞으로 올림
+            self.after(80, self._mac_bring_to_front_once)
+
+    def _mac_bring_to_front_once(self) -> None:
+        try:
+            self.update_idletasks()
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(250, self._mac_clear_topmost)
+        except tk.TclError:
+            pass
+
+    def _mac_clear_topmost(self) -> None:
+        try:
+            self.attributes("-topmost", False)
+        except tk.TclError:
+            pass
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self, padding=8)
@@ -794,11 +814,11 @@ class MapleAlertApp(tk.Tk):
             fps_txt = f"{fps:.0f} FPS"
         self._sound_armed = True
         if hwnd is not None:
-            self._status.config(
-                text=f"송출 중 — 선택 창 (창 ID {hwnd}), {fps_txt}"
-            )
+            self._stream_status_text = f"송출 중 — 선택 창 (창 ID {hwnd}), {fps_txt}"
+            self._status.config(text=self._stream_status_text)
         else:
-            self._status.config(text=f"송출 중 — 모니터 {mon}, {fps_txt}")
+            self._stream_status_text = f"송출 중 — 모니터 {mon}, {fps_txt}"
+            self._status.config(text=self._stream_status_text)
 
     def _detection_worker_loop(self) -> None:
         """OCR·템플릿 감지는 메인(UI) 스레드가 아닌 여기서만 실행."""
@@ -853,6 +873,7 @@ class MapleAlertApp(tk.Tk):
         with self._det_lock:
             self._last_det_triggered = False
             self._last_det_reason = ""
+        self._stream_status_text = ""
         self._status.config(text="중지됨")
 
         def join_bg() -> None:
@@ -1016,15 +1037,23 @@ class MapleAlertApp(tk.Tk):
                 else:
                     vis = frame
                 h, w = vis.shape[:2]
-                scale = self._preview_scale
-                nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                cw_meas = self._canvas.winfo_width()
+                ch_meas = self._canvas.winfo_height()
+                # 레이아웃 전 1px 등이면 기본값(기존과 동일한 느낌으로 스케일만 계산)
+                cw = cw_meas if cw_meas > 8 else 800
+                ch = ch_meas if ch_meas > 8 else 600
+                base = float(self._preview_scale)
+                bw = max(1.0, w * base)
+                bh = max(1.0, h * base)
+                # 송출 해상도가 미리보기 영역보다 크면 비율 유지해 캔버스 안에 맞춤(세로·가로 잘림 방지)
+                fit = min(1.0, cw / bw, ch / bh)
+                total = base * fit
+                nw, nh = max(1, int(w * total)), max(1, int(h * total))
                 small = cv2.resize(vis, (nw, nh), interpolation=cv2.INTER_AREA)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 pil = Image.fromarray(rgb)
                 self._photo = ImageTk.PhotoImage(image=pil)
                 self._canvas.delete("all")
-                cw = self._canvas.winfo_width() or 800
-                ch = self._canvas.winfo_height() or 600
                 x = max(0, (cw - nw) // 2)
                 y = max(0, (ch - nh) // 2)
                 self._canvas.create_image(x, y, anchor=tk.NW, image=self._photo)
@@ -1082,26 +1111,85 @@ class MapleAlertApp(tk.Tk):
                     foreground="gray" if all_ok else "#a63",
                 )
         if self._thread is not None:
+            cap_err = self._thread.get_capture_error()
             with self._det_lock:
                 triggered = self._last_det_triggered
                 reason = self._last_det_reason
-            if triggered:
+            if cap_err:
+                short = cap_err if len(cap_err) <= 140 else cap_err[:137] + "…"
+                self._status.config(text=f"캡처 실패 — {short}", foreground="#a63")
+            elif triggered:
                 self._status.config(
                     text=f"알림! ({reason}) — {time.strftime('%H:%M:%S')}"
                 )
                 self._try_alert_sound()
+            elif self._stream_status_text:
+                self._status.config(text=self._stream_status_text)
             self._was_triggered_last = triggered
         else:
             self._was_triggered_last = False
         self.after(50, self._poll_detection_ui)
 
 
+def _frozen_exe_dir() -> Path | None:
+    if not getattr(sys, "frozen", False):
+        return None
+    return Path(sys.executable).resolve().parent
+
+
+def _frozen_boot_log(msg: str) -> None:
+    d = _frozen_exe_dir()
+    if d is None:
+        return
+    try:
+        p = d / "cyj_startup_log.txt"
+        with p.open("a", encoding="utf-8") as f:
+            f.write(msg.rstrip() + "\n")
+    except OSError:
+        pass
+
+
 def main() -> None:
+    d = _frozen_exe_dir()
+    if d is not None:
+        try:
+            (d / "cyj_startup_log.txt").write_text(
+                f"시작 {time.strftime('%H:%M:%S')}\n"
+                "ONNX/OpenCV 로딩에 수십 초 걸릴 수 있습니다. Dock 아이콘만 보이면 잠시 기다려 주세요.\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
     _set_process_display_name(APP_NAME)
+    _frozen_boot_log("ensure_pre_gui_init …")
     ensure_pre_gui_init()
+    _frozen_boot_log("Tk 앱 생성 …")
     app = MapleAlertApp()
+    _frozen_boot_log("mainloop 진입")
     app.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException:
+        d = _frozen_exe_dir()
+        if d is not None:
+            try:
+                (d / "cyj_fatal_error.txt").write_text(
+                    traceback.format_exc(), encoding="utf-8"
+                )
+            except OSError:
+                pass
+        if getattr(sys, "frozen", False) and sys.platform == "darwin":
+            # console=False 빌드에서도 사용자가 터미널로 실행한 경우 메시지 표시
+            try:
+                print(
+                    "치명적 오류가 발생했습니다. 실행 파일과 같은 폴더의 "
+                    "cyj_fatal_error.txt 를 확인하세요.",
+                    file=sys.stderr,
+                )
+            except OSError:
+                pass
+        raise
