@@ -56,6 +56,14 @@ from PIL import Image, ImageTk
 from capture import CaptureThread
 from detection.ocr_backends import ENGINE_RAPIDOCR
 
+from app_platform import (
+    ensure_pre_gui_init,
+    enumerate_windows,
+    play_alert_sound,
+    stop_queued_alert_sounds,
+    window_pick_supported,
+)
+
 from detection import (
     ALL_OCR_ENGINES,
     DEFAULT_OCR_ENGINE,
@@ -99,14 +107,7 @@ def _parse_template_paths(raw: str) -> tuple[str, ...]:
             out.append(p)
     return tuple(out)
 
-if sys.platform == "win32":
-    from windows_capture import enumerate_windows
-else:
-
-    def enumerate_windows(*args, **kwargs):  # type: ignore
-        return []
-
-# Windows Tesseract 기본 경로 (없으면 PATH에 tesseract 있어야 함)
+# Tesseract: Windows 기본 경로 / macOS Homebrew·Intel 경로 (없으면 PATH)
 if sys.platform == "win32":
     _TESS_DEFAULT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     try:
@@ -119,6 +120,18 @@ if sys.platform == "win32":
         from tesseract_win_console import apply_pytesseract_windows_no_console
 
         apply_pytesseract_windows_no_console()
+    except ImportError:
+        pass
+elif sys.platform == "darwin":
+    try:
+        import os
+
+        import pytesseract
+
+        for _tp in ("/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"):
+            if os.path.isfile(_tp):
+                pytesseract.pytesseract.tesseract_cmd = _tp
+                break
     except ImportError:
         pass
 
@@ -175,35 +188,6 @@ def _set_process_display_name(name: str) -> None:
             ctypes.windll.kernel32.SetConsoleTitleW(name)
         except Exception:
             pass
-
-
-def stop_queued_alert_sounds() -> None:
-    """Windows: SND_ASYNC 로 쌓인 재생 큐 비우기(중지 후 이전 알림 소리가 이어질 때)."""
-    if sys.platform == "win32":
-        import winsound
-
-        try:
-            winsound.PlaySound(None, winsound.SND_PURGE)
-        except Exception:
-            pass
-
-
-def play_alert_sound() -> None:
-    if sys.platform == "win32":
-        import winsound
-
-        # SND_NOSTOP: 이미 재생 중이면 새 요청 무시(쿨타임 밀림·중첩 완화)
-        flags = (
-            winsound.SND_ALIAS
-            | winsound.SND_ASYNC
-            | winsound.SND_NOSTOP
-        )
-        winsound.PlaySound("SystemExclamation", flags)
-    else:
-        try:
-            import winsound  # type: ignore
-        except ImportError:
-            print("\a", end="", flush=True)
 
 
 class MapleAlertApp(tk.Tk):
@@ -285,7 +269,7 @@ class MapleAlertApp(tk.Tk):
         src.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self._src_mode = tk.StringVar(value="monitor")
-        if sys.platform == "win32":
+        if window_pick_supported():
             ttk.Radiobutton(
                 src,
                 text="모니터 전체",
@@ -301,9 +285,10 @@ class MapleAlertApp(tk.Tk):
                 command=self._on_src_mode_change,
             ).pack(side=tk.LEFT, padx=(0, 12))
         else:
-            ttk.Label(src, text="모니터만 지원 (Windows에서 창 선택 가능)").pack(
-                side=tk.LEFT
-            )
+            ttk.Label(
+                src,
+                text="모니터만 지원 (창 선택은 Windows·macOS에서 가능)",
+            ).pack(side=tk.LEFT)
 
         self._mon_label = ttk.Label(src, text="모니터 #")
         self._mon_label.pack(side=tk.LEFT)
@@ -336,7 +321,7 @@ class MapleAlertApp(tk.Tk):
         self._btn_start.pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_fr, text="중지", command=self._stop).pack(side=tk.LEFT, padx=2)
 
-        if sys.platform == "win32":
+        if window_pick_supported():
             self._on_src_mode_change()
 
         mid = ttk.LabelFrame(self, text="송출 화면 (미리보기·OCR 동일)", padding=4)
@@ -494,7 +479,7 @@ class MapleAlertApp(tk.Tk):
         return min(u, cap)
 
     def _on_src_mode_change(self) -> None:
-        if sys.platform != "win32":
+        if not window_pick_supported():
             return
         if self._src_mode.get() == "monitor":
             self._mon_spin.configure(state="normal")
@@ -506,7 +491,7 @@ class MapleAlertApp(tk.Tk):
             self._pick_btn.configure(state="normal")
 
     def _open_window_picker(self) -> None:
-        if sys.platform != "win32":
+        if not window_pick_supported():
             return
         dlg = tk.Toplevel(self)
         dlg.title("캡처할 창 선택")
@@ -626,10 +611,10 @@ class MapleAlertApp(tk.Tk):
             if v == "stream":
                 v = "monitor"
             if v in ("monitor", "window"):
-                if sys.platform != "win32" and v == "window":
+                if not window_pick_supported() and v == "window":
                     v = "monitor"
                 self._src_mode.set(v)
-        if sys.platform == "win32":
+        if window_pick_supported():
             self._on_src_mode_change()
         if "window_geometry" in d:
             g = str(d["window_geometry"]).strip()
@@ -774,7 +759,7 @@ class MapleAlertApp(tk.Tk):
 
         hwnd: int | None = None
         mon = 1
-        if sys.platform == "win32" and self._src_mode.get() == "window":
+        if window_pick_supported() and self._src_mode.get() == "window":
             if self._picked_hwnd is None:
                 messagebox.showwarning(
                     "창 선택",
@@ -810,7 +795,7 @@ class MapleAlertApp(tk.Tk):
         self._sound_armed = True
         if hwnd is not None:
             self._status.config(
-                text=f"송출 중 — 선택 창 (HWND {hwnd}), {fps_txt}"
+                text=f"송출 중 — 선택 창 (창 ID {hwnd}), {fps_txt}"
             )
         else:
             self._status.config(text=f"송출 중 — 모니터 {mon}, {fps_txt}")
@@ -1113,10 +1098,7 @@ class MapleAlertApp(tk.Tk):
 
 def main() -> None:
     _set_process_display_name(APP_NAME)
-    if sys.platform == "win32":
-        from windows_capture import ensure_windows_dpi_awareness
-
-        ensure_windows_dpi_awareness()
+    ensure_pre_gui_init()
     app = MapleAlertApp()
     app.mainloop()
 

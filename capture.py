@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import threading
 import time
-import sys
 from typing import Callable, Optional, Union
 
 import mss
 import numpy as np
+
+from app_platform.host import make_window_capture, window_pick_supported
 
 
 class ScreenCapture:
@@ -52,11 +53,9 @@ def _make_capture(
     window_hwnd: Optional[int],
 ) -> Union[ScreenCapture, object]:
     if window_hwnd is not None:
-        if sys.platform != "win32":
-            raise OSError("창 캡처는 Windows에서만 지원됩니다.")
-        from windows_capture import WindowCapture
-
-        return WindowCapture(window_hwnd)
+        if not window_pick_supported():
+            raise OSError("창 캡처는 이 운영체제에서 지원되지 않습니다.")
+        return make_window_capture(window_hwnd)
     return ScreenCapture(monitor_index=monitor_index)
 
 

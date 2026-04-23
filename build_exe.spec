@@ -41,6 +41,10 @@ except Exception:
 
 _base_hidden = [
     "PIL._tkinter_finder",
+    "app_platform",
+    "app_platform.audio",
+    "app_platform.host",
+    "app_platform.models",
     "detection",
     "detection.common",
     "detection.keywords",

@@ -7,3 +7,4 @@ pytesseract>=0.3.10
 # 키워드 OCR 엔진 (선택)
 easyocr>=1.7.0
 rapidocr-onnxruntime>=1.3.0
+pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'

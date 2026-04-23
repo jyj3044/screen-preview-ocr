@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
 from typing import List, Optional
 
 import mss
 import numpy as np
+
+from app_platform.models import WindowEntry
 
 if sys.platform != "win32":
     raise ImportError("windows_capture는 Windows에서만 사용할 수 있습니다.")
@@ -65,13 +66,6 @@ def _exe_basename_from_pid(pid: int) -> str:
     finally:
         kernel32.CloseHandle(h)
     return f"pid:{pid}"
-
-
-@dataclass(frozen=True)
-class WindowEntry:
-    hwnd: int
-    title: str
-    process_name: str
 
 
 def enumerate_windows(min_width: int = 80, min_height: int = 80) -> List[WindowEntry]:
